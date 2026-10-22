@@ -1,0 +1,1518 @@
+diff --git a/docs/named-output-permissions.md b/docs/named-output-permissions.md
+new file mode 100644
+index 0000000..8d2e060
+--- /dev/null
++++ b/docs/named-output-permissions.md
+@@ -0,0 +1,41 @@
++# Operator-owned output directory permissions
++
++This optional policy keeps existing projects readable while restricting persistent command writes to explicit new output directories. It does not expose permission controls in `codex_task`. Keep the original project registry, ROOTS ceiling, database, and conversation scopes so historical jobs remain queryable. Old project execution targets fail closed; select a fresh output project.
++
++The bridge requires both operator environment variables:
++
++```sh
++CODEX_MCP_BRIDGE_DEFAULT_PERMISSION_PROFILE=example-project-full-example-version
++CODEX_MCP_BRIDGE_EXPECTED_WRITABLE_ROOTS='["/Users/example/KD/ExampleProject-RSI-full-example-version"]'
++CODEX_MCP_BRIDGE_DEFAULT_SANDBOX=workspace-write
++CODEX_MCP_BRIDGE_ALLOW_WRITE=1
++CODEX_MCP_BRIDGE_ALLOW_DANGER_FULL_ACCESS=0
++CODEX_MCP_BRIDGE_APPROVAL_POLICY=never
++```
++
++Create and register the output directory before starting the replacement bridge. Its canonical absolute path must match the requested cwd exactly. These settings are included in the execution envelope fingerprint. They do not alter the historical allowed-root registry.
++
++Use a new operator-owned launcher wrapping the fixed CLI, without editing the existing Codex home or project configuration. Pass these arguments before the forwarded CLI arguments:
++
++```sh
++exec /opt/homebrew/bin/node /Users/example/Apps/codex-mcp-bridge-runtime/node_modules/.bin/codex \
++  -c 'default_permissions="example-project-full-example-version"' \
++  -c 'permissions.example-project-full-example-version={ extends = ":read-only", filesystem = { "/Users/example/KD/ExampleProject" = "read", "/Users/example/KD/ExampleProject-RSI-full-example-version" = "write" }, network = { enabled = false } }' \
++  "$@"
++```
++
++Point `CODEX_MCP_BRIDGE_CODEX` to that new executable launcher. The operator owns this wrapper and the environment; task prompts cannot supply CLI `-c` overrides. Keep the old service stopped only when ready to replace it, retaining its files for rollback. A configuration change does not resolve an already pending approval.
++
++Before every fresh/continued/forked model turn, the adapter reads the effective configuration with `config/read` for that cwd. The supported initial subset requires an explicit matching `default_permissions`, `extends=":read-only"`, exact absolute `write` rules matching the operator list, disabled networking, and no extra workspace roots, nested grants, named parents, or socket grants. Unsupported or broader policies fail before a model turn. Runtime policy evidence must confirm the exact profile ID, cwd, never/on-request policy selected by the operator, disabled network, no global temporary write grant, and no unexpected roots in the legacy projection. New threads send `permissions` without `sandbox`; subsequent turns preserve that profile ID without reconstructing it from the projection.
++
++The fixed CLI 0.153.3 omits cwd writes from legacy `sandbox.writableRoots`; an empty array alone is not proof of read-only access. Full profile configuration is the write-boundary authority. For continuation, the original context is resumed without permission overrides and checked before any turn; a different or legacy profile is not silently migrated.
++
++`never` returns sandbox failures directly; it does not grant escalation. Commands needing unsupported browser/system privileges can still fail. Existing files inside the new output directory can be revised; files in the original project remain read-only. This is directory isolation, not per-file append-only semantics.
++
++Optional real macOS verification, with zero model turns and an isolated temporary CODEX_HOME:
++
++```sh
++./node_modules/.bin/tsx scripts/verify-named-output-profile.ts /Users/example/Apps/codex-mcp-bridge-runtime/node_modules/.bin/codex
++```
++
++The check uses `codex sandbox -P ... -C ... -- ...`, never `thread/shellCommand`. It tests reading original fixture files, creating output, denied overwrite/delete/outside writes, and denied symlink escape; it also checks actual config/read and thread/start policy responses. The retained fixture path contains evidence. It does not modify the real project, existing configuration, credentials, bridge state, or active jobs.
+diff --git a/scripts/verify-named-output-profile.ts b/scripts/verify-named-output-profile.ts
+new file mode 100644
+index 0000000..9db70bf
+--- /dev/null
++++ b/scripts/verify-named-output-profile.ts
+@@ -0,0 +1,77 @@
++/** Optional no-LLM macOS smoke check. All canaries/config/state are new files
++ * in a retained temporary fixture. Never use thread/shellCommand as a sandbox. */
++import assert from "node:assert/strict";
++import { spawn, spawnSync } from "node:child_process";
++import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import readline from "node:readline";
++import { verifyNamedPermissionConfig } from "../src/namedPermissionProfile.js";
++import { verifyExecutionAccess } from "../src/executionAccess.js";
++
++const cli = process.argv[2];
++if (process.platform !== "darwin" || !cli || !path.isAbsolute(cli)) throw new Error("Usage on macOS: tsx scripts/verify-named-output-profile.ts /absolute/path/to/codex");
++const root = realpathSync(mkdtempSync(path.join(tmpdir(), "bridge-output-profile-smoke-")));
++const home = path.join(root, "home"), original = path.join(root, "original"), output = path.join(root, "output"), outside = path.join(root, "outside");
++for (const directory of [home, original, output, outside]) mkdirSync(directory);
++writeFileSync(path.join(original, "keep.txt"), "original");
++writeFileSync(path.join(original, "remove.txt"), "preserve");
++symlinkSync(original, path.join(output, "old-link"));
++const profile = "bridge-output-fixture";
++const profileDefinition = `{ extends = ":read-only", filesystem = { ${JSON.stringify(original)} = "read", ${JSON.stringify(output)} = "write" }, network = { enabled = false } }`;
++const overrides = ["-c", `default_permissions=${JSON.stringify(profile)}`, "-c", `permissions.${profile}=${profileDefinition}`, "-c", 'approval_policy="never"'];
++const environment = { PATH: process.env.PATH!, HOME: home, CODEX_HOME: home, TMPDIR: outside };
++const check = `const fs = require("node:fs"), path = require("node:path"), assert = require("node:assert/strict");
++const [old, output, outside] = process.argv.slice(1);
++assert.equal(fs.readFileSync(path.join(old,"keep.txt"),"utf8"),"original");
++fs.writeFileSync(path.join(output,"new.txt"),"new");
++for (const action of [()=>fs.writeFileSync(path.join(old,"keep.txt"),"changed"),()=>fs.unlinkSync(path.join(old,"remove.txt")),()=>fs.writeFileSync(path.join(outside,"escape.txt"),"changed"),()=>fs.writeFileSync(path.join(output,"old-link","keep.txt"),"changed")]) {
++assert.throws(action, error=>error.code==="EPERM"||error.code==="EACCES");
++}
++console.log(JSON.stringify({readOld:true,writeNew:true,overwriteOld:"denied",deleteOld:"denied",writeOutside:"denied",symlinkEscape:"denied"}));`;
++const sandbox = spawnSync(cli, [...overrides, "sandbox", "-P", profile, "-C", output, "--", process.execPath, "-e", check, original, output, outside],
++  { cwd: output, env: environment, encoding: "utf8", timeout: 30_000 });
++writeFileSync(path.join(root, "sandbox-evidence.json"), JSON.stringify({ status: sandbox.status, stdout: sandbox.stdout, stderr: sandbox.stderr }, null, 2));
++assert.equal(sandbox.status, 0, sandbox.stderr || sandbox.stdout || String(sandbox.error));
++assert.equal(readFileSync(path.join(original, "keep.txt"), "utf8"), "original");
++assert.equal(readFileSync(path.join(original, "remove.txt"), "utf8"), "preserve");
++
++const child = spawn(cli, [...overrides, "app-server", "--listen", "stdio://"], { cwd: output, env: environment, stdio: ["pipe", "pipe", "pipe"] });
++const pending = new Map<number, { resolve(value: any): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
++let sequence = 0, approvalRequests = 0;
++const lines = readline.createInterface({ input: child.stdout });
++lines.on("line", line => {
++  const message = JSON.parse(line);
++  if (message.method && message.id !== undefined) { approvalRequests += 1; return; }
++  const request = pending.get(message.id);
++  if (!request) return;
++  clearTimeout(request.timer); pending.delete(message.id);
++  if (message.error) request.reject(new Error(JSON.stringify(message.error))); else request.resolve(message.result);
++});
++child.stderr.resume();
++function request(method: string, params: unknown): Promise<any> {
++  return new Promise((resolve, reject) => {
++    const id = ++sequence, timer = setTimeout(() => { pending.delete(id); reject(new Error(`Timed out: ${method}`)); }, 20_000);
++    pending.set(id, { resolve, reject, timer }); child.stdin.write(JSON.stringify({ id, method, params }) + "\n");
++  });
++}
++try {
++  await request("initialize", { clientInfo: { name: "isolated-output-smoke", version: "1" }, capabilities: { experimentalApi: true } });
++  child.stdin.write('{"method":"initialized"}\n');
++  const access = { cwd: output, sandbox: "workspace-write" as const, approvalPolicy: "never" as const, approvalsReviewer: "user" as const,
++    permissionProfile: profile, expectedWritableRoots: [output] };
++  const config = await request("config/read", { cwd: output, includeLayers: false });
++  verifyNamedPermissionConfig(config.config, access);
++  const result = await request("thread/start", { cwd: output, runtimeWorkspaceRoots: [output], permissions: profile, approvalPolicy: "never", approvalsReviewer: "user", ephemeral: true, experimentalRawEvents: false });
++  verifyExecutionAccess(result, access, "thread/start");
++  assert.equal(approvalRequests, 0);
++  writeFileSync(path.join(root, "policy-evidence.json"), JSON.stringify({ activePermissionProfile: result.activePermissionProfile, sandbox: result.sandbox,
++    config: { default_permissions: config.config.default_permissions, permissions: config.config.permissions }, approvalRequests, modelTurnsStarted: 0 }, null, 2));
++  console.log(JSON.stringify({ fixture: root, sandbox: JSON.parse(sandbox.stdout), profileVerified: true, approvalRequests, modelTurnsStarted: 0 }));
++} finally {
++  for (const item of pending.values()) clearTimeout(item.timer);
++  child.stdin.end();
++  const timer = setTimeout(() => child.kill("SIGTERM"), 3_000);
++  await new Promise<void>(resolve => child.once("exit", () => resolve()));
++  clearTimeout(timer); lines.close();
++}
+diff --git a/src/appServerUpstream.ts b/src/appServerUpstream.ts
+index cbcded2..44803a5 100644
+--- a/src/appServerUpstream.ts
++++ b/src/appServerUpstream.ts
+@@ -1,3 +1,4 @@
++import { verifyNamedPermissionConfig } from "./namedPermissionProfile.js";
+ import { validateInitializeResponse } from "./runtimeCompatibility.js";
+ import type { ThreadPersistence, ThreadReleaseEvidence, ThreadReleaseOptions, ThreadReleaseResult } from "./threadConnections.js";
+ import { elicitationResponse, readElicitationInput } from "./mcpElicitation.js";
+@@ -135,6 +136,8 @@ type TurnContext = {
+   lastAgentMessageEventAt: number;
+   inputOrigins: Map<string, "app-approval" | "unknown">;
+   inputRoutingVerified: boolean;
++  asyncQuestionItems: Map<string, string | null>;
++  nativeAsyncStarts: Map<string, string | null>;
+ };
+ 
+ type PendingInteraction = CodexPendingInteraction & {
+@@ -689,7 +692,7 @@ export class CodexAppServerUpstreamPool implements CodexUpstream {
+     response: CodexInteractionResponse
+   ): Promise<void> {
+     for (const worker of this.workers) {
+-      if (worker.connection?.respondToInteraction(interactionId, response)) return;
++      if (await worker.connection?.respondToInteraction(interactionId, response)) return;
+     }
+     throw new Error("Unknown or already resolved Codex interaction id.");
+   }
+@@ -917,6 +920,7 @@ class AppServerConnection {
+   private readonly threadAccess = new Map<string, VerifiedExecutionAccess>();
+   private readonly threadLineage = new Map<string, CodexThreadLineage>();
+   private readonly pendingInteractions = new Map<string, PendingInteraction>();
++  private readonly pendingAsyncQuestions = new Map<string, { interaction: CodexPendingInteraction; dispatched: boolean }>();
+   private readonly terminalTurns = new Set<string>();
+   private readonly threadTokenTotals = new Map<string, TokenCounts>();
+   private readonly threadLoadRevisions = new Map<string, number>();
+@@ -1059,6 +1063,7 @@ class AppServerConnection {
+     onAssigned?: (assignment: UpstreamWorkerAssignment) => void
+   ): Promise<ToolResult> {
+     const expectedAccess = executionAccessRequest(args);
++    await this.verifyOperatorProfileConfig(expectedAccess);
+     const response = await this.rpc.request<Record<string, unknown>>(
+       "thread/start",
+       {
+@@ -1128,6 +1133,7 @@ class AppServerConnection {
+     onAssigned?: (assignment: UpstreamWorkerAssignment) => void
+   ): Promise<ToolResult> {
+     const expectedAccess = executionAccessRequest(args);
++    if (expectedAccess.permissionProfile) await this.ensureThreadLoaded(sourceThreadId, expectedAccess);
+     const response = await this.rpc.request<Record<string, unknown>>(
+       "thread/fork",
+       { threadId: sourceThreadId, ephemeral: args.ephemeral === true, ...threadAccessParams(expectedAccess) },
+@@ -1328,7 +1334,20 @@ class AppServerConnection {
+     }
+   }
+ 
++  private async verifyOperatorProfileConfig(access: ExecutionAccessRequest): Promise<void> {
++    if (!access.permissionProfile) return;
++    let response: Record<string, unknown>;
++    try {
++      response = await this.rpc.request<Record<string, unknown>>("config/read", { cwd: access.cwd, includeLayers: false },
++        { timeoutMs: this.protocolOptions.requestTimeoutMs });
++    } catch (error) {
++      throw new Error("PERMISSION_PROFILE_CONFIG_UNVERIFIED: Could not read the effective operator profile. No turn was started.", { cause: error });
++    }
++    verifyNamedPermissionConfig(response.config, access);
++  }
++
+   private async ensureThreadLoaded(threadId: string, expectedAccess?: ExecutionAccessRequest): Promise<CodexThreadLineage> {
++    if (expectedAccess) await this.verifyOperatorProfileConfig(expectedAccess);
+     const verified = this.threadAccess.get(threadId);
+     if (this.loadedThreads.has(threadId) && this.subscribedThreads.has(threadId) && (!expectedAccess || verified)) {
+       if (expectedAccess && verified) {
+@@ -1342,7 +1361,9 @@ class AppServerConnection {
+     this.threadTokenTotals.delete(threadId);
+     const response = await this.rpc.request<Record<string, unknown>>(
+       "thread/resume",
+-      { threadId, ...(expectedAccess ? threadAccessParams(expectedAccess) : {}) },
++      // Named-profile continuations inspect the original permissions first. Sending
++      // overrides here would silently migrate an old context before verification.
++      { threadId, ...(expectedAccess && !expectedAccess.permissionProfile ? threadAccessParams(expectedAccess) : {}) },
+       {
+         timeoutMs: this.protocolOptions.requestTimeoutMs,
+         lateResponseContext: { threadId, loadRevision }
+@@ -1416,10 +1437,38 @@ class AppServerConnection {
+     return pending && !pending.answered ? structuredClone(pending.privateInput) : undefined;
+   }
+ 
+-  respondToInteraction(
++  async respondToInteraction(
+     interactionId: string,
+     response: CodexInteractionResponse
+-  ): boolean {
++  ): Promise<boolean> {
++    const asynchronous = this.pendingAsyncQuestions.get(interactionId);
++    if (asynchronous) {
++      const input = asynchronous.interaction;
++      const context = this.activeTurns.get(input.turnId);
++      if (asynchronous.dispatched || input.origin !== "codex-question" || !context ||
++          context.threadId !== input.threadId || this.threadTurns.get(input.threadId) !== input.turnId) {
++        throw new Error("QUESTION_UNAVAILABLE: The original asynchronous question is no longer answerable.");
++      }
++      if (response.decision || response.elicitation || !response.answers ||
++          JSON.stringify(Object.keys(response.answers).sort()) !== JSON.stringify(input.questions!.map(q => q.id).sort()) ||
++          Object.values(response.answers).some(values => !Array.isArray(values) || !values.length || values.some(value => typeof value !== "string" || !value.trim() || value.length > 2000))) {
++        throw new Error("Answers must match the exact pending asynchronous question ids.");
++      }
++      // CLI 0.153.3 explicitly delivers async replies as a new user message.
++      // This readable layout is bridge presentation, not a native wire encoding.
++      const text = input.questions!.map((q, index) =>
++        `${index + 1}. ${q.question}\n${response.answers![q.id].join("\n")}`
++      ).join("\n\n");
++      asynchronous.dispatched = true; // An uncertain RPC result must never be resent.
++      const result = await this.rpc.request<Record<string, unknown>>("turn/steer", {
++        threadId: input.threadId, expectedTurnId: input.turnId,
++        input: [{ type: "text", text, text_elements: [] }]
++      }, { timeoutMs: this.protocolOptions.requestTimeoutMs,
++        lateResponseContext: { threadId: input.threadId, turnId: input.turnId } });
++      if (result.turnId !== input.turnId) throw new Error("Asynchronous answer returned a different turn id.");
++      this.pendingAsyncQuestions.delete(interactionId);
++      return true;
++    }
+     const pending = this.pendingInteractions.get(interactionId);
+     if (!pending) return false;
+     if (pending.answered) throw new Error("This Codex interaction response was already submitted.");
+@@ -1557,6 +1606,7 @@ class AppServerConnection {
+       pending.reject(new Error("Codex App Server closed before the interaction was answered."));
+     }
+     this.pendingInteractions.clear();
++    this.pendingAsyncQuestions.clear();
+     await this.rpc.close();
+   }
+ 
+@@ -1630,7 +1680,9 @@ class AppServerConnection {
+       commandOutputTails: new Map(),
+       lastAgentMessageEventAt: 0,
+       inputOrigins: new Map(),
+-      inputRoutingVerified
++      inputRoutingVerified,
++      asyncQuestionItems: new Map(),
++      nativeAsyncStarts: new Map()
+     };
+     this.activeTurns.set(turnId, context);
+     this.threadTurns.set(threadId, turnId);
+@@ -1822,8 +1874,11 @@ class AppServerConnection {
+     }
+     if (method === "item/started" || method === "item/completed") {
+       const item = isRecord(params.item) ? params.item : undefined;
+-      if (!item || item.type === "reasoning") return;
+-      if (typeof item.id === "string") {
++      if (!item) return;
++      const trustedNativeAsyncItem = threadId === context.threadId && params.turnId === context.turnId &&
++        this.observeNativeAsyncItem(context, item, method === "item/started" ? "started" : "completed");
++      if (item.type === "reasoning") return;
++      if (typeof item.id === "string" && !trustedNativeAsyncItem) {
+         // Client-provided dynamic tools never establish native question origin.
+         context.inputOrigins.set(item.id, item.type === "mcpToolCall" ? "app-approval" : "unknown");
+         if (context.inputOrigins.size > 200) context.inputOrigins.delete(context.inputOrigins.keys().next().value!);
+@@ -1833,6 +1888,53 @@ class AppServerConnection {
+     }
+   }
+ 
++  private observeNativeAsyncItem(
++    context: TurnContext, item: Record<string, unknown>, phase: "started" | "completed"
++  ): boolean {
++    if (typeof item.id !== "string") return false;
++    const questions = nativeAsyncQuestions(item);
++    const fingerprint = questions ? JSON.stringify(questions) : null;
++    const started = context.nativeAsyncStarts.get(item.id);
++    const completed = context.asyncQuestionItems.get(item.id);
++    const origin = questionOrigin(context.inputRoutingVerified,
++      context.inputOrigins.get(item.id), (questions || []).map(q => q.id));
++    if (started === null || completed === null) return false;
++    if ((started !== undefined || completed !== undefined) &&
++        (fingerprint === null || (started !== undefined && started !== fingerprint) ||
++          (completed !== undefined && completed !== fingerprint) || origin !== "codex-question")) {
++      // A source or metadata conflict revokes this identity for the whole turn.
++      context.nativeAsyncStarts.set(item.id, null);
++      context.asyncQuestionItems.set(item.id, null);
++      const interactionId = `${this.workerId}:${this.generation}:async:${item.id}`;
++      if (this.pendingAsyncQuestions.delete(interactionId)) {
++        this.emit(context, event("input-required", "completed", "The native asynchronous question changed and is no longer answerable.",
++          { resolvedInteractionId: interactionId, resolution: "metadata-changed" }));
++      }
++      return false;
++    }
++    // Existing unknown/dynamic/app-approval associations are never upgraded.
++    if (!questions || fingerprint === null || origin !== "codex-question") return false;
++    if (phase === "started") {
++      if (context.nativeAsyncStarts.size >= 200 && started === undefined) return false;
++      // Positive native lifecycle provenance is separate from legacy RPC origins.
++      // Do not overwrite this trusted started item with the generic unknown tag.
++      context.nativeAsyncStarts.set(item.id, fingerprint);
++      return true;
++    }
++    if (completed !== undefined) return true; // Exact completed replay.
++    if (context.asyncQuestionItems.size >= 200) return false;
++    context.asyncQuestionItems.set(item.id, fingerprint);
++    const interactionId = `${this.workerId}:${this.generation}:async:${item.id}`;
++    const interaction: CodexPendingInteraction = {
++      interactionId, kind: "user-input", origin: "codex-question", transport: "async-user-message",
++      threadId: context.threadId, turnId: context.turnId, itemId: item.id,
++      summary: "Codex requested asynchronous user input.", isBlocking: false, questions
++    };
++    this.pendingAsyncQuestions.set(interactionId, { interaction, dispatched: false });
++    this.emit(context, event("input-required", "updated", interaction.summary, { interaction }));
++    return true;
++  }
++
+   private resolvePendingServerRequest(
+     params: Record<string, unknown>,
+     resolution: "server-resolved" | "expired"
+@@ -2025,6 +2127,9 @@ class AppServerConnection {
+       interaction.reject(new Error("Codex turn ended before the pending interaction was answered."));
+       this.pendingInteractions.delete(interactionId);
+     }
++    for (const [id, pending] of this.pendingAsyncQuestions) {
++      if (pending.interaction.turnId === context.turnId) this.pendingAsyncQuestions.delete(id);
++    }
+     const errorMessage = isRecord(turn.error)
+       ? optionalString(turn.error.message) || JSON.stringify(turn.error).slice(0, 1_000)
+       : undefined;
+@@ -2059,6 +2164,7 @@ class AppServerConnection {
+       interaction.reject(terminalError);
+     }
+     this.pendingInteractions.clear();
++    this.pendingAsyncQuestions.clear();
+     for (const context of this.activeTurns.values()) context.reject(terminalError);
+     this.activeTurns.clear();
+     this.threadTurns.clear();
+@@ -2453,6 +2559,23 @@ function readTokenUsageBreakdown(value: unknown): Record<string, number> | null
+   return entries.length > 0 ? Object.fromEntries(entries) : null;
+ }
+ 
++function nativeAsyncQuestions(item: Record<string, unknown>): NonNullable<CodexPendingInteraction["questions"]> | undefined {
++  if (item.type !== "agentMessage" || item.delivery !== "async" || typeof item.id !== "string" ||
++      !item.id || item.id.length > 120 || !Array.isArray(item.questions) ||
++      !item.questions.length || item.questions.length > MAX_CODEX_INTERACTION_QUESTIONS) return undefined;
++  const questions: NonNullable<CodexPendingInteraction["questions"]> = [];
++  for (const [index, value] of item.questions.entries()) {
++    if (!isRecord(value) || value.isSecret === true || typeof value.title !== "string" ||
++        !value.title.trim() || value.title.length > 1000 ||
++        (value.options !== null && value.options !== undefined && (!Array.isArray(value.options) ||
++          !value.options.length || value.options.length > 10 || value.options.some(option => typeof option !== "string" || !option.trim() || option.length > 120)))) return undefined;
++    questions.push({ id: `async:${item.id}:${index}`, header: "Input", question: value.title,
++      isSecret: false, isOther: true,
++      ...(Array.isArray(value.options) ? { options: value.options.map(label => ({ label, description: "" })) } : {}) });
++  }
++  return questions;
++}
++
+ function publicItemEvent(
+   item: Record<string, unknown>,
+   phase: "started" | "completed",
+@@ -2462,7 +2585,13 @@ function publicItemEvent(
+   if (item.type === "agentMessage") {
+     const text = optionalString(item.text);
+     if (text) context.finalMessage = text;
+-    return event("agent-message", phase, text?.slice(0, 1_000) || `Agent message ${phase}.`, { itemId });
++    const questions = nativeAsyncQuestions(item);
++    return event("agent-message", phase, text?.slice(0, 1_000) || `Agent message ${phase}.`, {
++      itemId,
++      ...(item.delivery === "async" ? { delivery: "async" } : {}),
++      ...(questions ? { questions: questions.map(q => ({ title: q.question,
++        options: q.options?.map(option => option.label) || null })) } : {})
++    });
+   }
+   if (item.type === "plan") {
+     return event("plan", phase, (optionalString(item.text) || `Plan ${phase}.`).slice(0, 1_000), { itemId });
+diff --git a/src/config.ts b/src/config.ts
+index 81c3ebc..93b4470 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -1,6 +1,8 @@
+ import path from "node:path";
++import { parseNamedPermissionConstraints } from "./namedPermissionProfile.js";
++import { X509Certificate } from "node:crypto";
+ import { realpathSync, statSync } from "node:fs";
+-import { readdir } from "node:fs/promises";
++import { readFile, readdir } from "node:fs/promises";
+ import { homedir } from "node:os";
+ import { validateModelPolicy, type ModelChoice } from "./modelPolicy.js";
+ import { PRODUCT_INFO } from "./productInfo.js";
+@@ -41,6 +43,8 @@ export type BridgeConfig = {
+   allowDangerFullAccess: boolean;
+   defaultApprovalPolicy: ApprovalPolicy;
+   defaultApprovalsReviewer: ApprovalsReviewer;
++  defaultPermissionProfile?: string;
++  expectedWritableRoots?: string[];
+   operatorModelCeiling?: ModelChoice[];
+   modelCatalogCacheTtlMs: number;
+   modelCatalogTimeoutMs: number;
+@@ -87,6 +91,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
+   const allowDangerFullAccess = parseBool(read("ALLOW_DANGER_FULL_ACCESS"));
+   const defaultApprovalPolicy = parseApprovalPolicy(read("APPROVAL_POLICY") || "on-request");
+   const defaultApprovalsReviewer = parseApprovalsReviewer(read("APPROVALS_REVIEWER") || "user");
++  const namedPermissions = parseNamedPermissionConstraints(normalizeOptional(read("DEFAULT_PERMISSION_PROFILE")), normalizeOptional(read("EXPECTED_WRITABLE_ROOTS")));
+   const operatorModelCeiling = parseModelSelectionCeiling(read("MODEL_SELECTION_CEILING"));
+   const modelCatalogCacheTtlMs = parsePositiveInt(read("MODEL_CATALOG_CACHE_TTL_MS") || "600000");
+   const modelCatalogTimeoutMs = parsePositiveInt(read("MODEL_CATALOG_TIMEOUT_MS") || "30000");
+@@ -216,6 +221,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
+     allowDangerFullAccess,
+     defaultApprovalPolicy,
+     defaultApprovalsReviewer,
++    ...(namedPermissions.permissionProfile ? { defaultPermissionProfile: namedPermissions.permissionProfile, expectedWritableRoots: namedPermissions.expectedWritableRoots } : {}),
+     operatorModelCeiling,
+     modelCatalogCacheTtlMs,
+     modelCatalogTimeoutMs,
+@@ -396,6 +402,7 @@ async function scanSensitiveFiles(root: string, maxFindings: number): Promise<st
+           (lower.startsWith(".env.") && lower !== ".env.example") ||
+           deniedExtensions.some((ext) => lower.endsWith(ext))
+         ) {
++          if (entry.isFile() && await isPublicCertifiBundle(root, fullPath)) continue;
+           findings.push(fullPath);
+           continue;
+         }
+@@ -407,6 +414,28 @@ async function scanSensitiveFiles(root: string, maxFindings: number): Promise<st
+   return findings.sort();
+ }
+ 
++// certifi ships public trust anchors inside Python environments. Do not exempt
++// arbitrary PEMs, symlinks, private keys, malformed files, or the rest of a venv.
++async function isPublicCertifiBundle(root: string, file: string): Promise<boolean> {
++  const relative = path.relative(root, file).split(path.sep).join("/");
++  // The environment may belong to a nested project; pip vendors certifi too.
++  const certifiPath = /^(?:[^/]+\/)*(?:\.venv|venv)\/lib\/python\d+\.\d+\/site-packages\/(?:pip\/_vendor\/)?certifi\/cacert\.pem$/;
++  if (relative.startsWith("../") || !certifiPath.test(relative)) return false;
++  try {
++    const info = statSync(file);
++    if (!info.isFile() || info.size === 0 || info.size > 1024 * 1024) return false;
++    const contents = await readFile(file, "utf8");
++    if (Buffer.byteLength(contents, "utf8") > 1024 * 1024) return false;
++    if (/PRIVATE KEY-----/i.test(contents)) return false;
++    const withoutComments = contents.replace(/^#[^\r\n]*$/gm, "");
++    const blocks = withoutComments.match(/-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\r\n\t ]+-----END CERTIFICATE-----/g) || [];
++    if (blocks.length === 0 || withoutComments.replace(/-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\r\n\t ]+-----END CERTIFICATE-----/g, "").trim()) return false;
++    return blocks.every(block => new X509Certificate(block).ca);
++  } catch {
++    return false;
++  }
++}
++
+ function parseAllowedRoots(raw: string | undefined): string[] {
+   if (!raw) return [];
+   const roots = raw
+diff --git a/src/executionAccess.ts b/src/executionAccess.ts
+index 6e5aea0..8eec113 100644
+--- a/src/executionAccess.ts
++++ b/src/executionAccess.ts
+@@ -1,10 +1,11 @@
+ import { realpathSync } from "node:fs";
+ import path from "node:path";
++import { canonicalPermissionRoot, requireNamedProfileCwd, type NamedPermissionConstraints } from "./namedPermissionProfile.js";
+ import type { ApprovalPolicy, ApprovalsReviewer, SandboxMode } from "./config.js";
+ 
+ export type AppToolApprovalMode = "auto" | "approve";
+ 
+-export type ExecutionAccessRequest = {
++export type ExecutionAccessRequest = NamedPermissionConstraints & {
+   cwd: string;
+   sandbox: SandboxMode;
+   approvalPolicy: ApprovalPolicy;
+@@ -15,6 +16,7 @@ export type ExecutionAccessRequest = {
+ /** Private worker evidence. Keep complete policy details out of public logs. */
+ export type VerifiedExecutionAccess = Omit<ExecutionAccessRequest, "approvalsReviewer"> & {
+   sandboxPolicy: Record<string, unknown>;
++  runtimeWorkspaceRoots?: string[];
+   approvalsReviewer: string;
+   activePermissionProfile: { id: string; extends?: string | null } | null;
+ };
+@@ -31,19 +33,34 @@ export function executionAccessRequest(args: Record<string, unknown>): Execution
+       (appToolApprovalMode !== undefined && appToolApprovalMode !== "auto" && appToolApprovalMode !== "approve")) {
+     throw new Error("EXECUTION_ACCESS_REQUIRED: A known cwd, sandbox, and approval policy are required before executing a Codex turn.");
+   }
+-  return { cwd, sandbox: sandbox as SandboxMode, approvalPolicy: approvalPolicy as ApprovalPolicy,
++  const permissionProfile = args["permission-profile"], expectedWritableRoots = args["expected-writable-roots"];
++  if ((permissionProfile !== undefined || expectedWritableRoots !== undefined) &&
++      (typeof permissionProfile !== "string" || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(permissionProfile) ||
++       sandbox !== "workspace-write" || !Array.isArray(expectedWritableRoots) || !expectedWritableRoots.length ||
++       expectedWritableRoots.some(root => typeof root !== "string" || !path.isAbsolute(root)))) {
++    throw new Error("EXECUTION_ACCESS_REQUIRED: Invalid operator permission profile constraints.");
++  }
++  const named = permissionProfile ? { permissionProfile: permissionProfile as string, expectedWritableRoots: (expectedWritableRoots as string[]).map(canonicalPermissionRoot) } : {};
++  requireNamedProfileCwd({ cwd, ...named });
++  return { cwd, ...named, sandbox: sandbox as SandboxMode, approvalPolicy: approvalPolicy as ApprovalPolicy,
+     ...(approvalsReviewer !== undefined ? { approvalsReviewer } : {}),
+     ...(appToolApprovalMode !== undefined ? { appToolApprovalMode } : {}) };
+ }
+ 
+ export function executionAccessArguments(access: ExecutionAccessRequest): Record<string, unknown> {
+   return { cwd: access.cwd, sandbox: access.sandbox, "approval-policy": access.approvalPolicy,
++    ...(access.permissionProfile ? { "permission-profile": access.permissionProfile, "expected-writable-roots": [...access.expectedWritableRoots!] } : {}),
+     ...(access.approvalsReviewer !== undefined ? { "approvals-reviewer": access.approvalsReviewer } : {}),
+     ...(access.appToolApprovalMode !== undefined ? { "app-tool-approval-mode": access.appToolApprovalMode } : {}) };
+ }
+ 
+ export function threadAccessParams(access: ExecutionAccessRequest, config?: Record<string, unknown>): Record<string, unknown> {
+-  return { cwd: access.cwd, sandbox: access.sandbox, approvalPolicy: access.approvalPolicy,
++  if (access.permissionProfile && config && Object.keys(config).some(key => /^(permissions|default_permissions|sandbox_mode|sandbox_workspace_write)(\.|$)/.test(key))) {
++    throw new Error("PERMISSION_PROFILE_OVERRIDE_DENIED: Task configuration cannot override operator permissions.");
++  }
++  return { cwd: access.cwd,
++    ...(access.permissionProfile ? { permissions: access.permissionProfile, runtimeWorkspaceRoots: [access.cwd] } : { sandbox: access.sandbox }),
++    approvalPolicy: access.approvalPolicy,
+     ...(access.approvalsReviewer !== undefined ? { approvalsReviewer: access.approvalsReviewer } : {}),
+     ...(config || access.appToolApprovalMode !== undefined ? { config: {
+       ...config,
+@@ -81,6 +98,22 @@ export function verifyExecutionAccess(
+     mismatches.push("appToolApprovalMode (start a fresh context to change connector defaults)");
+   }
+   const profile = response.activePermissionProfile;
++  if (expected.permissionProfile) {
++    if (!record(profile) || profile.id !== expected.permissionProfile) mismatches.push("activePermissionProfile.id (start a fresh context to change profiles)");
++    if (!record(sandbox) || sandbox.type !== "workspaceWrite" || sandbox.networkAccess !== false ||
++        sandbox.excludeSlashTmp !== true || sandbox.excludeTmpdirEnvVar !== true || !Array.isArray(sandbox.writableRoots)) {
++      mismatches.push("named profile sandbox boundary");
++    } else {
++      try {
++        // The fixed CLI omits cwd from writableRoots; this is only an upper-
++        // bound cross-check. config/read verifies the complete profile first.
++        const projected = [expected.cwd, ...sandbox.writableRoots].map(root => canonicalPermissionRoot(root as string));
++        if (projected.some(root => !expected.expectedWritableRoots?.includes(root))) mismatches.push("sandbox.writableRoots (unrequested write access)");
++      } catch { mismatches.push("sandbox.writableRoots (unverifiable path)"); }
++    }
++    if (!Array.isArray(response.runtimeWorkspaceRoots) || response.runtimeWorkspaceRoots.length !== 1 ||
++        typeof response.runtimeWorkspaceRoots[0] !== "string" || canonicalPath(response.runtimeWorkspaceRoots[0]) !== canonicalPath(expected.cwd)) mismatches.push("runtimeWorkspaceRoots");
++  }
+   if (profile != null && (!record(profile) || typeof profile.id !== "string" || !profile.id ||
+       (profile.extends != null && typeof profile.extends !== "string"))) mismatches.push("activePermissionProfile");
+   if (mismatches.length) {
+@@ -89,6 +122,7 @@ export function verifyExecutionAccess(
+   return {
+     ...expected,
+     sandboxPolicy: structuredClone(sandbox as Record<string, unknown>),
++    ...(expected.permissionProfile ? { runtimeWorkspaceRoots: [expected.cwd] } : {}),
+     approvalsReviewer: response.approvalsReviewer as string,
+     activePermissionProfile: record(profile)
+       ? { id: profile.id as string, ...(profile.extends !== undefined ? { extends: profile.extends as string | null } : {}) }
+@@ -101,6 +135,7 @@ export function turnAccessParams(access: VerifiedExecutionAccess): Record<string
+     cwd: access.cwd,
+     approvalPolicy: access.approvalPolicy,
+     approvalsReviewer: access.approvalsReviewer,
++    ...(access.permissionProfile ? { runtimeWorkspaceRoots: [access.cwd] } : {}),
+     // Named profiles can contain restrictions absent from the legacy sandbox
+     // projection. Preserve their identity instead of reconstructing permissions.
+     ...(access.activePermissionProfile
+@@ -119,6 +154,7 @@ export function executionAccessEvidence(access: VerifiedExecutionAccess): Record
+       appToolApprovalEvidence: "thread-config-override-sent"
+     } : {}),
+     activePermissionProfile: structuredClone(access.activePermissionProfile),
++    ...(access.permissionProfile ? { writeBoundaryEvidence: "operator-profile-config-verified; legacy-roots-are-projection" } : {}),
+     networkAccess: policy.networkAccess ?? (access.sandbox === "danger-full-access"),
+     writableRootCount: Array.isArray(policy.writableRoots) ? policy.writableRoots.length : 0,
+     excludeSlashTmp: policy.excludeSlashTmp ?? null,
+diff --git a/src/executionPolicy.ts b/src/executionPolicy.ts
+index 7d002e2..99c57ec 100644
+--- a/src/executionPolicy.ts
++++ b/src/executionPolicy.ts
+@@ -1,8 +1,9 @@
+ import { enforceSandbox, type AccessStrategy, type BridgeConfig, type SandboxMode } from "./config.js";
++import { requireNamedProfileCwd } from "./namedPermissionProfile.js";
+ import type { ExecutionAccessRequest } from "./executionAccess.js";
+ 
+ /** Included in admission references: changing policy semantics invalidates old admission snapshots. */
+-export const EXECUTION_POLICY_VERSION = 1;
++export const EXECUTION_POLICY_VERSION = 2;
+ 
+ type AccessSettings = { accessStrategy: AccessStrategy };
+ 
+@@ -34,10 +35,15 @@ export function resolveExecutionPolicy(
+   existing?: SandboxMode
+ ): ExecutionAccessRequest {
+   const sandbox = resolveTaskSandbox(config, settings, existing);
++  if (config.defaultPermissionProfile) {
++    if (sandbox !== "workspace-write") throw new Error("PERMISSION_PROFILE_POLICY_CONFLICT: The configured output profile requires workspace-write; saved settings cannot broaden or replace it.");
++    requireNamedProfileCwd({ cwd, permissionProfile: config.defaultPermissionProfile, expectedWritableRoots: config.expectedWritableRoots });
++  }
+   const fullAccess = settings.accessStrategy === "always-full" && sandbox === "danger-full-access";
+   return {
+     cwd,
+     sandbox,
++    ...(config.defaultPermissionProfile ? { permissionProfile: config.defaultPermissionProfile, expectedWritableRoots: [...config.expectedWritableRoots!] } : {}),
+     approvalPolicy: fullAccess ? "never" : config.defaultApprovalPolicy,
+     approvalsReviewer: config.defaultApprovalsReviewer,
+     // A never policy alone can reject connector approval prompts. Configure
+diff --git a/src/namedPermissionProfile.ts b/src/namedPermissionProfile.ts
+new file mode 100644
+index 0000000..2e23a67
+--- /dev/null
++++ b/src/namedPermissionProfile.ts
+@@ -0,0 +1,68 @@
++import { realpathSync, statSync } from "node:fs";
++import path from "node:path";
++
++/** Operator-owned constraints; never part of the public task input schema. */
++export type NamedPermissionConstraints = { permissionProfile?: string; expectedWritableRoots?: string[] };
++
++export function canonicalPermissionRoot(value: string): string {
++  if (!path.isAbsolute(value) || !statSync(value).isDirectory()) throw new Error("Expected an existing absolute directory.");
++  const canonical = realpathSync(value);
++  if (canonical === path.parse(canonical).root) throw new Error("The filesystem root cannot be a named-profile output directory.");
++  return canonical;
++}
++
++export function parseNamedPermissionConstraints(profile: string | undefined, roots: string | undefined): NamedPermissionConstraints {
++  if (!profile && !roots) return {};
++  if (!profile || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(profile) || !roots) {
++    throw new Error("DEFAULT_PERMISSION_PROFILE and EXPECTED_WRITABLE_ROOTS must be configured together with a named profile and a JSON array of absolute output directories.");
++  }
++  try {
++    const parsed: unknown = JSON.parse(roots);
++    if (!Array.isArray(parsed) || !parsed.length || parsed.length > 16 || parsed.some(root => typeof root !== "string")) throw new Error();
++    const expectedWritableRoots = parsed.map(root => canonicalPermissionRoot(root as string));
++    if (new Set(expectedWritableRoots).size !== expectedWritableRoots.length) throw new Error();
++    return { permissionProfile: profile, expectedWritableRoots };
++  } catch {
++    throw new Error("EXPECTED_WRITABLE_ROOTS must be a nonempty JSON array of distinct existing absolute output directories, excluding the filesystem root.");
++  }
++}
++
++export function requireNamedProfileCwd(access: NamedPermissionConstraints & { cwd: string }): void {
++  if (!access.permissionProfile) return;
++  const roots = access.expectedWritableRoots;
++  if (!roots?.length || !roots.includes(canonicalPermissionRoot(access.cwd))) {
++    throw new Error("PERMISSION_PROFILE_POLICY_CONFLICT: Start fresh work in an explicitly configured output directory. Historical project roots remain readable history, not execution targets.");
++  }
++}
++
++/** config/read is authoritative for the complete named profile. The legacy
++ * sandbox projection can omit the cwd and cannot represent read carveouts. */
++export function verifyNamedPermissionConfig(config: unknown, access: NamedPermissionConstraints & { cwd: string }): void {
++  if (!access.permissionProfile) return;
++  requireNamedProfileCwd(access);
++  const fail = () => new Error("PERMISSION_PROFILE_CONFIG_MISMATCH: The effective profile is not a verified read-only base with only the operator's explicit output directories writable. No turn was started.");
++  if (!record(config) || config.default_permissions !== access.permissionProfile || !record(config.permissions)) throw fail();
++  const profile = config.permissions[access.permissionProfile];
++  if (!record(profile) || profile.extends !== ":read-only" || !record(profile.filesystem) || !record(profile.network) || profile.network.enabled !== false) throw fail();
++  if (Object.keys(profile).some(key => !["description", "extends", "filesystem", "network", "workspace_roots"].includes(key))) throw fail();
++  if (profile.workspace_roots != null && (!record(profile.workspace_roots) || Object.values(profile.workspace_roots).some(value => value !== false))) throw fail();
++  // Keep this first supported subset deliberately small. Additional grants,
++  // inheritance, scoped tables, and socket permissions require separate review.
++  if (Object.entries(profile.network).some(([key, value]) => key !== "enabled" && value != null && value !== false)) throw fail();
++  const writes = new Set<string>();
++  for (const [location, mode] of Object.entries(profile.filesystem)) {
++    if (location === "glob_scan_max_depth" && (mode == null || Number.isSafeInteger(mode))) continue;
++    if (mode === "read" || mode === "deny") continue;
++    if (mode !== "write") throw fail();
++    try {
++      const root = canonicalPermissionRoot(location);
++      if (!access.expectedWritableRoots!.includes(root)) throw fail();
++      writes.add(root);
++    } catch { throw fail(); }
++  }
++  if (writes.size !== access.expectedWritableRoots!.length || access.expectedWritableRoots!.some(root => !writes.has(root))) throw fail();
++}
++
++function record(value: unknown): value is Record<string, unknown> {
++  return value !== null && typeof value === "object" && !Array.isArray(value);
++}
+diff --git a/src/stateStore.ts b/src/stateStore.ts
+index 0b36fca..1f639de 100644
+--- a/src/stateStore.ts
++++ b/src/stateStore.ts
+@@ -1079,13 +1079,15 @@ export class BridgeStateStore {
+     });
+   }
+ 
+-  replaceJobs(jobs: JobRowInput[]): void {
+-    this.replaceJobsInternal(jobs);
++  replaceJobs(jobs: JobRowInput[], preservedJobIds: readonly string[] = []): void {
++    this.replaceJobsInternal(jobs, preservedJobIds);
+   }
+ 
+-  private replaceJobsInternal(jobs: JobRowInput[]): void {
++  private replaceJobsInternal(jobs: JobRowInput[], preservedJobIds: readonly string[]): void {
+     this.transaction(() => {
+-      const retainedIds = new Set(jobs.map((job) => job.jobId));
++      // A registry may expose only the current allowed-root projection. Rows
++      // outside that projection retain their original result and event bodies.
++      const retainedIds = new Set([...preservedJobIds, ...jobs.map((job) => job.jobId)]);
+       const existing = this.database
+         .prepare("SELECT job_id FROM jobs WHERE archived_at IS NULL")
+         .all() as Array<{ job_id: string }>;
+diff --git a/src/tools.ts b/src/tools.ts
+index 3fd2abb..22e827a 100644
+--- a/src/tools.ts
++++ b/src/tools.ts
+@@ -4363,9 +4363,15 @@ export class CodexJobRegistry {
+   private load(): void {
+     if (!this.stateStore) return;
+     const stored = this.stateStore.listJobs();
++    // Root policy only quarantines history. Keep those rows untouched when
++    // persisting restart reconciliation or actual retention removals.
++    const quarantinedJobIds = stored.flatMap((value) => {
++      const job = readPersistedJob(value);
++      return job && !this.isAllowedCwd(job.cwd) ? [job.jobId] : [];
++    });
+     const changed = this.loadJobs(stored);
+     if (changed || this.jobs.size !== stored.length) {
+-      this.stateStore.replaceJobs(this.persistedJobs());
++      this.stateStore.replaceJobs(this.persistedJobs(), quarantinedJobIds);
+     }
+   }
+ 
+@@ -16184,6 +16190,7 @@ function readPendingInteraction(value: unknown): CodexPendingInteraction | undef
+   return {
+     interactionId: value.interactionId.slice(0, 200),
+     ...(value.origin === "codex-question" || value.origin === "app-approval" || value.origin === "unknown" ? { origin: value.origin } : {}),
++    ...(kind === "user-input" && value.transport === "async-user-message" ? { transport: value.transport } : {}),
+     kind,
+     threadId: value.threadId.slice(0, 200),
+     turnId: value.turnId.slice(0, 200),
+diff --git a/src/upstream.ts b/src/upstream.ts
+index cea662e..53291e3 100644
+--- a/src/upstream.ts
++++ b/src/upstream.ts
+@@ -55,6 +55,8 @@ export type CodexInteractionInput = { url?: string; requestedSchema?: Record<str
+ export type CodexPendingInteraction = {
+   /** Positive correlation with the source tool item; unknown stays on the approval path. */
+   origin?: "codex-question" | "app-approval" | "unknown";
++  /** Native async questions receive a new user message, never an RPC reply. */
++  transport?: "async-user-message";
+   interactionId: string;
+   kind: "command-approval" | "file-approval" | "permission-approval" | "user-input" | "mcp-elicitation";
+   threadId: string;
+diff --git a/src/userSettings.ts b/src/userSettings.ts
+index a2449b0..1b4ef29 100644
+--- a/src/userSettings.ts
++++ b/src/userSettings.ts
+@@ -585,6 +585,8 @@ function canonicalExecutionOperatorEnvelope(config: BridgeConfig): Record<string
+     backend: config.defaultBackend,
+     allowedRoots: [...config.allowedRoots].sort(),
+     defaultSandbox: config.defaultSandbox,
++    defaultPermissionProfile: config.defaultPermissionProfile ?? null,
++    expectedWritableRoots: config.expectedWritableRoots ? [...config.expectedWritableRoots].sort() : null,
+     allowWorkspaceWrite: config.allowWorkspaceWrite,
+     allowDangerFullAccess: config.allowDangerFullAccess,
+     approvalPolicy: config.defaultApprovalPolicy,
+diff --git a/test/appServerUpstream.test.ts b/test/appServerUpstream.test.ts
+index 5352568..21ea423 100644
+--- a/test/appServerUpstream.test.ts
++++ b/test/appServerUpstream.test.ts
+@@ -828,6 +828,93 @@ describe("CodexAppServerUpstreamPool", () => {
+     } finally { await pool.close(); }
+   });
+ 
++  it.each(["input", "during answer", "completed only", "replayed start"])("preserves native async metadata, stable indexes and sends a new user message to the exact active turn (%s)", async variant => {
++    const pool = new CodexAppServerUpstreamPool(FIXTURE, 1);
++    const interactions: CodexPendingInteraction[] = [], events: CodexPublicEvent[] = [];
++    let running: Promise<unknown> | undefined;
++    try {
++      running = pool.callTool("codex", task(`native async ${variant}`), progress => {
++        if (progress.event) events.push(progress.event);
++        if (isInteraction(progress.event?.details?.interaction)) interactions.push(progress.event!.details!.interaction as CodexPendingInteraction);
++      });
++      const input = await nextInteraction(interactions, "user-input");
++      await eventually(() => events.filter(e => e.type === "agent-message" && e.phase === "completed").length === 2);
++      expect(interactions).toHaveLength(1);
++      expect(input).toMatchObject({ transport: "async-user-message", origin: "codex-question", isBlocking: false,
++        itemId: "call-native-async-question", questions: [
++          { id: "async:call-native-async-question:0", question: "Which color?", isOther: true },
++          { id: "async:call-native-async-question:1", question: "Any note?" }
++        ] });
++      expect(events.find(e => e.type === "agent-message")?.details).toMatchObject({ delivery: "async",
++        questions: [{ title: "Which color?", options: ["blue", "red"] }, { title: "Any note?", options: null }] });
++      await expect(pool.respondToInteraction(input.interactionId, { answers: { [input.questions![0].id]: ["blue"] } })).rejects.toThrow("exact pending");
++      await expect(pool.respondToInteraction(input.interactionId, { decision: "accept" })).rejects.toThrow("exact pending");
++      await pool.respondToInteraction(input.interactionId, { answers: {
++        [input.questions![0].id]: ["a freeform color"], [input.questions![1].id]: ["Only inspect"]
++      } });
++      await expect(running).resolves.toMatchObject({ content: [{ text: "STEERED:1. Which color?\na freeform color\n\n2. Any note?\nOnly inspect" }] });
++      await expect(pool.respondToInteraction(input.interactionId, { answers: {} })).rejects.toThrow("Unknown or already resolved");
++    } finally { await pool.close(); await running?.catch(() => undefined); }
++  });
++
++  it.each(["no questions", "prose", "secret", "associated unknown", "app approval", "wrong thread", "missing turn", "wrong turn",
++    "started only", "start conflict changed", "start conflict missing", "start conflict secret", "start conflict delivery", "late dynamic source", "late app source"])(
++    "does not promote native async %s into an ordinary question", async variant => {
++      const pool = new CodexAppServerUpstreamPool(FIXTURE, 1);
++      const interactions: CodexPendingInteraction[] = [];
++      try {
++        await pool.callTool("codex", task(`native async ${variant} terminal`), progress => {
++          if (isInteraction(progress.event?.details?.interaction)) interactions.push(progress.event!.details!.interaction as CodexPendingInteraction);
++        });
++        expect(interactions).toEqual([]);
++      } finally { await pool.close(); }
++    }
++  );
++
++  it.each(["disabled", "unsupported"])("fails closed for native async input with %s approval routing", async routing => {
++    const pool = new CodexAppServerUpstreamPool(FIXTURE, 1, { environment: { ...process.env, CODEX_TEST_QUESTION_ROUTING: routing } });
++    const interactions: CodexPendingInteraction[] = [];
++    try {
++      await pool.callTool("codex", task("native async terminal"), progress => {
++        if (isInteraction(progress.event?.details?.interaction)) interactions.push(progress.event!.details!.interaction as CodexPendingInteraction);
++      });
++      expect(interactions).toEqual([]);
++    } finally { await pool.close(); }
++  });
++
++  it.each(["changed", "revoked empty", "revoked secret", "revoked delivery", "revoked invalid", "terminal", "cancelled"])("rejects native async answers after %s", async variant => {
++    const pool = new CodexAppServerUpstreamPool(FIXTURE, 1);
++    const interactions: CodexPendingInteraction[] = [], events: CodexPublicEvent[] = [];
++    let running: Promise<unknown> | undefined;
++    try {
++      running = pool.callTool("codex", task(`native async ${variant}`), progress => {
++        if (progress.event) events.push(progress.event);
++        if (isInteraction(progress.event?.details?.interaction)) interactions.push(progress.event!.details!.interaction as CodexPendingInteraction);
++      });
++      const input = await nextInteraction(interactions, "user-input");
++      if (variant === "changed" || variant.startsWith("revoked")) await eventually(() => events.some(e => e.details?.resolution === "metadata-changed"));
++      else await running;
++      await expect(pool.respondToInteraction(input.interactionId, { answers: {
++        [input.questions![0].id]: ["blue"], [input.questions![1].id]: ["note"]
++      } })).rejects.toThrow("Unknown or already resolved");
++    } finally { await pool.close(); await running?.catch(() => undefined); }
++  });
++
++  it("never resends an uncertain native async answer", async () => {
++    const pool = new CodexAppServerUpstreamPool(FIXTURE, 1, { requestTimeoutMs: 100 });
++    const interactions: CodexPendingInteraction[] = [];
++    let running: Promise<unknown> | undefined;
++    try {
++      running = pool.callTool("codex", task("native async uncertain"), progress => {
++        if (isInteraction(progress.event?.details?.interaction)) interactions.push(progress.event!.details!.interaction as CodexPendingInteraction);
++      });
++      const input = await nextInteraction(interactions, "user-input");
++      const answer = { answers: { [input.questions![0].id]: ["blue"], [input.questions![1].id]: ["note"] } };
++      await expect(pool.respondToInteraction(input.interactionId, answer)).rejects.toThrow();
++      await expect(pool.respondToInteraction(input.interactionId, answer)).rejects.toThrow("no longer answerable");
++    } finally { await pool.close(); await running?.catch(() => undefined); }
++  });
++
+   it("keeps nonblocking questions and closed choices distinct from blocking input", async () => {
+     const pool = new CodexAppServerUpstreamPool(FIXTURE, 1);
+     const interactions: CodexPendingInteraction[] = [], events: CodexPublicEvent[] = [];
+diff --git a/test/config.test.ts b/test/config.test.ts
+index ae198e9..4d9d515 100644
+--- a/test/config.test.ts
++++ b/test/config.test.ts
+@@ -1,5 +1,7 @@
+-import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
++import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
++import { X509Certificate } from "node:crypto";
+ import { tmpdir } from "node:os";
++import { rootCertificates } from "node:tls";
+ import path from "node:path";
+ import { describe, expect, it } from "vitest";
+ import {
+@@ -374,6 +376,121 @@ describe("config policy", () => {
+     expect(config.defaultAccessStrategy).toBe("always-full");
+   });
+ 
++  it("recognizes the nested pip-vendored certifi CA path used by ExampleProject RSI", async () => {
++    const root = mkdtempSync(path.join(tmpdir(), "nested-certifi-ca-"));
++    const directory = path.join(root, "web/rsi/.venv/lib/python3.14/site-packages/pip/_vendor/certifi");
++    mkdirSync(directory, { recursive: true });
++    writeFileSync(path.join(directory, "cacert.pem"), `# public CA fixture\n${rootCertificates[0]}\n`);
++    expect(await findSensitiveFiles(root)).toEqual([]);
++  });
++
++  it.each([
++    "venv/lib/python3.14/site-packages/pip/_vendor/certifi/cacert.pem",
++    "web/rsi/.venv/lib/python3.14/site-packages/certifi/cacert.pem",
++    "services/nested/venv/lib/python3.12/site-packages/pip/_vendor/certifi/cacert.pem"
++  ])("allows only public CA content at the standard environment path %s", async relative => {
++    const root = mkdtempSync(path.join(tmpdir(), "nested-certifi-ca-"));
++    const bundle = path.join(root, relative);
++    mkdirSync(path.dirname(bundle), { recursive: true });
++    writeFileSync(bundle, `# public CA fixture\n${rootCertificates[0]}\n`);
++    expect(await findSensitiveFiles(root)).toEqual([]);
++  });
++
++  it.each([
++    "web/rsi/env/lib/python3.14/site-packages/pip/_vendor/certifi/cacert.pem",
++    "web/rsi/.venv/lib64/python3.14/site-packages/pip/_vendor/certifi/cacert.pem",
++    "web/rsi/.venv/lib/python3.14/dist-packages/pip/_vendor/certifi/cacert.pem",
++    "web/rsi/.venv/lib/python3.14/site-packages/setuptools/_vendor/certifi/cacert.pem",
++    "web/rsi/.venv/lib/python3.14/site-packages/pip/_vendor/other/certifi/cacert.pem",
++    "web/rsi/pip/_vendor/certifi/cacert.pem",
++    "web/rsi/.venv/lib/python3.14/site-packages/pip/_vendor/certifi/server.pem",
++    "web/rsi/.venv/lib/python3.14/site-packages/pip/_vendor/certifi/cacert.PEM"
++  ])("does not exempt neighboring nonstandard certificate path %s", async relative => {
++    const root = mkdtempSync(path.join(tmpdir(), "nested-certifi-denied-"));
++    const bundle = path.join(root, relative);
++    mkdirSync(path.dirname(bundle), { recursive: true });
++    writeFileSync(bundle, rootCertificates[0]);
++    expect(await findSensitiveFiles(root)).toEqual([bundle]);
++  });
++
++  it.each([
++    ["empty", ""],
++    ["comments only", "# no certificates\n"],
++    ["malformed certificate", "-----BEGIN CERTIFICATE-----\nmalformed\n-----END CERTIFICATE-----\n"],
++    ["mixed ordinary text", `${rootCertificates[0]}\nunexpected contents\n`],
++    ["oversized", "# " + "-".repeat(1024 * 1024) + "\n" + rootCertificates[0]],
++    ["repeated unclosed certificate headers", "-----BEGIN CERTIFICATE-----\n".repeat(19000)]
++  ])("rejects %s in nested pip-vendored certifi", async (_name, contents) => {
++    const root = mkdtempSync(path.join(tmpdir(), "nested-certifi-content-"));
++    const bundle = path.join(root, "web/rsi/.venv/lib/python3.14/site-packages/pip/_vendor/certifi/cacert.pem");
++    mkdirSync(path.dirname(bundle), { recursive: true });
++    writeFileSync(bundle, contents);
++    expect(await findSensitiveFiles(root)).toEqual([bundle]);
++  });
++
++  it.each(["PRIVATE KEY", "ENCRYPTED PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY"])(
++    "rejects %s markers even in nested certifi comments", async keyType => {
++      const root = mkdtempSync(path.join(tmpdir(), "nested-certifi-key-"));
++      const bundle = path.join(root, "web/rsi/.venv/lib/python3.14/site-packages/pip/_vendor/certifi/cacert.pem");
++      mkdirSync(path.dirname(bundle), { recursive: true });
++      for (const prefix of ["", "# "]) {
++        writeFileSync(bundle, rootCertificates[0] + `\n${prefix}-----BEGIN ${keyType}-----\n${prefix}synthetic\n${prefix}-----END ${keyType}-----\n`);
++        expect(await findSensitiveFiles(root)).toEqual([bundle]);
++      }
++    }
++  );
++
++  it("rejects a valid non-CA certificate at the nested certifi path", async () => {
++    const root = mkdtempSync(path.join(tmpdir(), "nested-certifi-leaf-"));
++    const bundle = path.join(root, "web/rsi/.venv/lib/python3.14/site-packages/pip/_vendor/certifi/cacert.pem");
++    mkdirSync(path.dirname(bundle), { recursive: true });
++    const leaf = readFileSync(new URL("./fixtures/non-ca-certificate.pem", import.meta.url), "utf8");
++    expect(new X509Certificate(leaf).ca).toBe(false);
++    writeFileSync(bundle, rootCertificates[0] + "\n" + leaf);
++    expect(await findSensitiveFiles(root)).toEqual([bundle]);
++  });
++
++  it("rejects a symlink named cacert.pem inside nested pip-vendored certifi", async () => {
++    const root = mkdtempSync(path.join(tmpdir(), "nested-certifi-symlink-"));
++    const targetRoot = mkdtempSync(path.join(tmpdir(), "public-ca-target-"));
++    const target = path.join(targetRoot, "public-ca.pem");
++    const bundle = path.join(root, "web/rsi/.venv/lib/python3.14/site-packages/pip/_vendor/certifi/cacert.pem");
++    mkdirSync(path.dirname(bundle), { recursive: true });
++    writeFileSync(target, rootCertificates[0]);
++    symlinkSync(target, bundle);
++    expect(await findSensitiveFiles(root)).toEqual([bundle]);
++  });
++
++  it("allows only certificate-only certifi CA bundles in standard virtualenv paths", async () => {
++    const root = mkdtempSync(path.join(tmpdir(), "certifi-public-ca-"));
++    const certifi = path.join(root, ".venv/lib/python3.12/site-packages/certifi");
++    mkdirSync(certifi, { recursive: true });
++    const bundle = path.join(certifi, "cacert.pem");
++    const publicBundle = `# certifi public CA fixture\n${rootCertificates[0]}\n`;
++    writeFileSync(bundle, publicBundle);
++    expect(await findSensitiveFiles(root)).toEqual([]);
++    writeFileSync(bundle, `${publicBundle}\n-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n`);
++    expect(await findSensitiveFiles(root)).toEqual([bundle]);
++    writeFileSync(bundle, "-----BEGIN CERTIFICATE-----\nmalformed\n-----END CERTIFICATE-----\n");
++    expect(await findSensitiveFiles(root)).toEqual([bundle]);
++    for (const keyType of ["PRIVATE KEY", "ENCRYPTED PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "OPENSSH PRIVATE KEY"]) {
++      writeFileSync(bundle, publicBundle + `# -----BEGIN ${keyType}-----\n# secret\n# -----END ${keyType}-----\n`);
++      expect(await findSensitiveFiles(root)).toEqual([bundle]);
++    }
++    writeFileSync(bundle, "# " + "-".repeat(512 * 1024) + "\n" + publicBundle);
++    expect(await findSensitiveFiles(root)).toEqual([]);
++    writeFileSync(bundle, "-----BEGIN CERTIFICATE-----\n".repeat(19000));
++    expect(await findSensitiveFiles(root)).toEqual([bundle]);
++    writeFileSync(bundle, "# comments only\n");
++    expect(await findSensitiveFiles(root)).toEqual([bundle]);
++    writeFileSync(bundle, publicBundle);
++    const otherPem = path.join(root, "server.pem");
++    writeFileSync(otherPem, publicBundle);
++    const secret = path.join(certifi, ".env");
++    writeFileSync(secret, "SECRET=example\n");
++    expect(await findSensitiveFiles(root)).toEqual([secret, otherPem]);
++  });
++
+   it("finds sensitive-looking files before delegation", async () => {
+     const root = mkdtempSync(path.join(tmpdir(), "bridge-root-"));
+     writeFileSync(path.join(root, ".env"), "TOKEN=secret\n");
+diff --git a/test/fixtures/app-server-policy-fixture.mjs b/test/fixtures/app-server-policy-fixture.mjs
+index a496b77..8c63314 100644
+--- a/test/fixtures/app-server-policy-fixture.mjs
++++ b/test/fixtures/app-server-policy-fixture.mjs
+@@ -15,6 +15,17 @@ export function threadPolicyResponse(method, params, threadId) {
+       : previous.sandbox || { type: "readOnly", networkAccess: false },
+     activePermissionProfile: null
+   };
++  if (params.permissions) {
++    assert.equal(params.sandbox, undefined, "profile selection cannot be combined with sandbox");
++    const config = JSON.parse(process.env.CODEX_TEST_PROFILE_CONFIG || "{}");
++    const profile = config.permissions?.[params.permissions];
++    response.activePermissionProfile = { id: params.permissions, extends: profile?.extends ?? null };
++    response.sandbox = { type: "workspaceWrite", writableRoots: Object.entries(profile?.filesystem || {})
++      .filter(([root, mode]) => mode === "write" && root !== response.cwd).map(([root]) => root),
++      networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true,
++      ...JSON.parse(process.env.CODEX_TEST_PROFILE_SANDBOX || "{}") };
++  } else if (previous.activePermissionProfile) response.activePermissionProfile = previous.activePermissionProfile;
++  response.runtimeWorkspaceRoots = params.runtimeWorkspaceRoots ?? previous.runtimeWorkspaceRoots ?? [response.cwd];
+   if (process.env.CODEX_TEST_NAMED_PROFILE) response.activePermissionProfile = { id: process.env.CODEX_TEST_NAMED_PROFILE };
+   policies.set(threadId, response);
+   const [mismatchMethod, field] = (process.env.CODEX_TEST_POLICY_MISMATCH || "").split(":");
+@@ -30,6 +41,7 @@ export function threadPolicyResponse(method, params, threadId) {
+ 
+ export function assertTurnPolicy(params) {
+   if (process.env.CODEX_TEST_TURN_LOG) appendFileSync(process.env.CODEX_TEST_TURN_LOG, "turn/start\n");
++  if (process.env.CODEX_TEST_TURN_POLICY_LOG) appendFileSync(process.env.CODEX_TEST_TURN_POLICY_LOG, JSON.stringify(params) + "\n");
+   const expected = policies.get(params.threadId);
+   assert.ok(expected, "turn must have a verified thread policy");
+   assert.equal(params.cwd, expected.cwd);
+diff --git a/test/fixtures/fake-codex-app-server.mjs b/test/fixtures/fake-codex-app-server.mjs
+index 7127fee..9c9f7f8 100755
+--- a/test/fixtures/fake-codex-app-server.mjs
++++ b/test/fixtures/fake-codex-app-server.mjs
+@@ -80,6 +80,11 @@ lines.on("line", (line) => {
+     return;
+   }
+ 
++  if (message.method === "config/read") {
++    response(message.id, { config: JSON.parse(process.env.CODEX_TEST_PROFILE_CONFIG_FILE ? readFileSync(process.env.CODEX_TEST_PROFILE_CONFIG_FILE, "utf8") : process.env.CODEX_TEST_PROFILE_CONFIG || "{}"), origins: {}, layers: null });
++    return;
++  }
++
+   if (message.method === "account/read") {
+     response(message.id, {
+       account: process.argv.includes("--api-account") ? { type: "apiKey" }
+@@ -377,6 +382,11 @@ lines.on("line", (line) => {
+       send({ id: message.id, error: { code: -32000, message: "turn precondition failed" } });
+       return;
+     }
++    if (context.prompt.includes("native async during answer")) notification("item/completed", {
++      threadId: context.threadId, turnId: context.turnId,
++      item: { type: "agentMessage", id: "call-native-async-question", delivery: "async", questions: null, text: "Question withdrawn" }
++    });
++    if (context.prompt === "native async uncertain") return; // Simulate delivery with no acknowledgment.
+     response(message.id, { turnId: context.turnId });
+     finishTurn(context, "completed", `STEERED:${message.params.input?.[0]?.text || ""}`);
+     return;
+@@ -447,6 +457,43 @@ function beginTurn(context) {
+     });
+     return;
+   }
++  if (prompt.startsWith("native async ")) {
++    const id = "call-native-async-question";
++    if (prompt.includes("associated unknown")) notification("item/started", { threadId, turnId, item: { type: "dynamicToolCall", id } });
++    if (prompt.includes("app approval")) notification("item/started", { threadId, turnId, item: { type: "mcpToolCall", id } });
++    const item = { type: "agentMessage", id, text: "Choose a color and provide a note", delivery: "async", phase: "final_answer", memoryCitation: null,
++      questions: [{ title: "Which color?", options: ["blue", "red"] }, { title: "Any note?", options: null }] };
++    if (prompt.includes("no questions")) item.questions = null;
++    if (prompt.includes("prose")) delete item.delivery;
++    if (prompt.includes("secret") && !prompt.includes("revoked") && !prompt.includes("start conflict")) item.questions[0].isSecret = true;
++    const nativeParams = { threadId: prompt.includes("wrong thread") ? "another-thread" : threadId,
++      ...(prompt.includes("missing turn") ? {} : { turnId: prompt.includes("wrong turn") ? "another-turn" : turnId }), item };
++    // rust-v0.153.3 handler and event_mapping emit this lifecycle in order.
++    if (!prompt.includes("completed only")) notification("item/started", { ...nativeParams, startedAtMs: Date.now() });
++    if (prompt.includes("replayed start")) notification("item/started", { ...nativeParams, startedAtMs: Date.now() });
++    if (prompt.includes("started only")) { finishTurn(context, "completed", "STARTED ONLY"); return; }
++    if (prompt.includes("late dynamic source")) notification("item/started", { threadId, turnId, item: { type: "dynamicToolCall", id } });
++    if (prompt.includes("late app source")) notification("item/started", { threadId, turnId, item: { type: "mcpToolCall", id } });
++    const completedItem = { ...item };
++    if (prompt.includes("start conflict changed")) completedItem.questions = [{ title: "Changed before completion", options: null }];
++    if (prompt.includes("start conflict missing")) completedItem.questions = null;
++    if (prompt.includes("start conflict secret")) completedItem.questions = [{ title: "Secret input", options: null, isSecret: true }];
++    if (prompt.includes("start conflict delivery")) completedItem.delivery = "sync";
++    const completedParams = { ...nativeParams, item: completedItem, completedAtMs: Date.now() };
++    notification("item/completed", completedParams);
++    notification("item/completed", completedParams); // Exact transport replay.
++    if (prompt.includes("changed") || prompt.includes("revoked")) {
++      const changed = { ...item, questions: [{ title: "Changed question", options: null }] };
++      if (prompt.includes("revoked empty")) changed.questions = null;
++      if (prompt.includes("revoked secret")) changed.questions[0].isSecret = true;
++      if (prompt.includes("revoked delivery")) changed.delivery = "sync";
++      if (prompt.includes("revoked invalid")) changed.questions[0].title = "";
++      notification("item/completed", { threadId, turnId, item: changed });
++    }
++    if (prompt.includes("terminal")) finishTurn(context, "completed", "ASYNC TERMINAL");
++    if (prompt.includes("cancelled")) finishTurn(context, "interrupted", "ASYNC CANCELLED");
++    return;
++  }
+   if (["nonblocking input", "blocking input", "dynamic input", "legacy app input"].includes(prompt)) {
+     if (prompt === "dynamic input") notification("item/started", { threadId, turnId, item: { type: "dynamicToolCall", id: "question-1", namespace: "functions", tool: "request_user_input" } });
+     const questionId = prompt === "legacy app input" ? "mcp_tool_call_approval_1" : "color";
+diff --git a/test/fixtures/non-ca-certificate.pem b/test/fixtures/non-ca-certificate.pem
+new file mode 100644
+index 0000000..8865525
+--- /dev/null
++++ b/test/fixtures/non-ca-certificate.pem
+@@ -0,0 +1,18 @@
++-----BEGIN CERTIFICATE-----
++MIIC3zCCAcegAwIBAgIJAIcfKPt9XeLmMA0GCSqGSIb3DQEBCwUAMCYxJDAiBgNV
++BAMMG25vbi1jYS1jZXJ0aWZpLXRlc3QuaW52YWxpZDAeFw0yNjEwMTUxNjM1MDJa
++Fw0zNjEwMTIxNjM1MDJaMCYxJDAiBgNVBAMMG25vbi1jYS1jZXJ0aWZpLXRlc3Qu
++aW52YWxpZDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKu17dKszZu3
++8J9ZxwJDzBy90Qalj4vBkSk5VJ2KQxa+LPeL0wu2MrJkOJizjPsHGSIqOGh8pdPH
++HYD9IKDmmDDScLLMyrG5M5Zbx9WMjUicTLMzOkgM5zuN72OcwBIfatH3ZBzfMjOR
++kXO47yAg+Eh74dDC8K/Sg31oBJnCXVUHDttrbazrRdqL2S9xllsWmru+gK8YnbP2
++JCchdT1TDNGJA11CJurCgiBLUr+4TW8EnAdalE4Y+nIObqHGFtmHmLYzZLV4fB/1
+++PvgJE3xH1NA3rM69fJuF/QonLlg//1u7wjJaNiE6F8MZJxXBe3YRn3gX68IKUkN
++byAkj0zGPbUCAwEAAaMQMA4wDAYDVR0TAQH/BAIwADANBgkqhkiG9w0BAQsFAAOC
++AQEAV7XknihgCUuXPVWMFVbyHT9YiBJf88RbI7KC91gfY1IJc62zFqVfwN3PRjW+
++EeJkix8noxaAq6Fk2CQHo/QpT5JxKGvpjaO7Q8Fta0XHC6NHYVtMy9RKOPlfOQmD
++VQ52d1sW5nmGb/nXMdNnR1/fXNd6QVq1O+JgmTjcI5O/v1/c5RbLfNJ9qkC98ngw
++wWmw3W92KHFaBH7kH/S9d+cYudh54QC5IZk/Bt+L3MFNLq/RRFRPXnMIyJ8Iy9lg
++CsNLVd5EvKxPiMsvqlwj57vm4cURNcD82v1CiS45N9WfTe+sJ/c7rnSkHd+q9Ov5
++DjBOTesGxnIlH+jCJRy5PJUUXQ==
++-----END CERTIFICATE-----
+diff --git a/test/jobRegistry.test.ts b/test/jobRegistry.test.ts
+index c58c2d9..a812065 100644
+--- a/test/jobRegistry.test.ts
++++ b/test/jobRegistry.test.ts
+@@ -268,19 +268,45 @@ describe("CodexJobRegistry persistence", () => {
+     expect(registry.listCancellationIntents({ jobId: workerLost.jobId })).toHaveLength(0);
+   });
+ 
+-  it("drops persisted jobs whose cwd is outside the configured roots", async () => {
++  it("quarantines jobs outside temporary roots without losing their results or events", async () => {
+     const firstRoot = temporaryRoot();
+     const secondRoot = temporaryRoot();
+     const stateFile = path.join(firstRoot, "private", "state.sqlite");
+     const registry = persistentRegistry(firstRoot, stateFile);
+-    const job = registry.start(jobInput(firstRoot), async () => result("thread-one"));
++    const job = registry.start(jobInput(firstRoot), async (progress) => {
++      progress({ event: {
++        eventId: "retained-command", type: "command", phase: "completed",
++        createdAt: Date.now(), summary: "Read-only inspection finished"
++      } });
++      return result("retained-answer");
++    });
+     await job.promise;
+-
++    const events = registry.admissionStateStore.listJobEvents(job.jobId);
++    expect(events.some(event => event.eventType === "app-command-completed")).toBe(true);
++    const retained = registry.admissionStateStore.listJobs();
+     registry.admissionStateStore.close();
+-    const restored = persistentRegistry(secondRoot, stateFile);
+ 
+-    expect(restored.get(job.jobId)).toBeUndefined();
+-    expect(restored.size).toBe(0);
++    const narrowed = persistentRegistry(secondRoot, stateFile);
++    expect(narrowed.get(job.jobId)).toBeUndefined();
++    expect(narrowed.size).toBe(0);
++    expect(narrowed.admissionStateStore.listJobs()).toEqual(retained);
++    expect(narrowed.admissionStateStore.listJobEvents(job.jobId)).toEqual(events);
++    expect(narrowed.getActivity(job.activityId)).toMatchObject({ activityId: job.activityId, scopeId: SCOPE_A });
++    // Saving new in-range work must not subsequently remove quarantined history.
++    const newJob = narrowed.start({ ...jobInput(secondRoot), requestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
++      async () => result("new-in-range-answer"));
++    await newJob.promise;
++    narrowed.admissionStateStore.close();
++
++    const restored = persistentRegistry(firstRoot, stateFile);
++    expect(restored.get(job.jobId)).toMatchObject({
++      jobId: job.jobId, scopeId: SCOPE_A, status: "completed",
++      result: { content: [{ type: "text", text: "retained-answer" }] }
++    });
++    expect(restored.admissionStateStore.listJobEvents(job.jobId)).toEqual(events);
++    expect(restored.admissionStateStore.listJobs()).toHaveLength(2);
++    expect(restored.get(newJob.jobId)).toBeUndefined();
++    restored.admissionStateStore.close();
+   });
+ 
+   it("cancels a scope watcher promptly and releases its widget lease", async () => {
+diff --git a/test/namedPermissionProfile.test.ts b/test/namedPermissionProfile.test.ts
+new file mode 100644
+index 0000000..62ff964
+--- /dev/null
++++ b/test/namedPermissionProfile.test.ts
+@@ -0,0 +1,166 @@
++import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { describe, expect, it } from "vitest";
++import { loadConfig } from "../src/config.js";
++import { resolveExecutionPolicy } from "../src/executionPolicy.js";
++import { executionAccessArguments, threadAccessParams, verifyExecutionAccess } from "../src/executionAccess.js";
++import { verifyNamedPermissionConfig } from "../src/namedPermissionProfile.js";
++import { UserSettingsStore } from "../src/userSettings.js";
++import { CodexAppServerUpstreamPool } from "../src/appServerUpstream.js";
++
++function fixture() {
++  const directory = realpathSync(mkdtempSync(path.join(tmpdir(), "named-output-policy-")));
++  const cwd = path.join(directory, "output"), original = path.join(directory, "original");
++  mkdirSync(cwd); mkdirSync(original);
++  const profile = "isolated-output";
++  const environment = { CODEX_MCP_BRIDGE_NO_AUTH: "1", CODEX_MCP_BRIDGE_ALLOW_WRITE: "1",
++    CODEX_MCP_BRIDGE_DEFAULT_SANDBOX: "workspace-write", CODEX_MCP_BRIDGE_APPROVAL_POLICY: "never",
++    CODEX_MCP_BRIDGE_DEFAULT_PERMISSION_PROFILE: profile, CODEX_MCP_BRIDGE_EXPECTED_WRITABLE_ROOTS: JSON.stringify([cwd]) };
++  const config = loadConfig(environment);
++  const access = resolveExecutionPolicy(config, { accessStrategy: "adaptive" }, cwd);
++  const effective = { default_permissions: profile, permissions: { [profile]: { extends: ":read-only", description: null,
++    workspace_roots: null, filesystem: { glob_scan_max_depth: null, [original]: "read", [cwd]: "write" },
++    network: { enabled: false, domains: null, unix_sockets: null } } } };
++  return { directory, cwd, original, profile, environment, config, access, effective };
++}
++
++function cleanup(directory: string) { rmSync(directory, { recursive: true, force: true }); }
++
++describe("operator-owned named output profile", () => {
++  it("combines never with workspace-write and full access disabled; task wire arguments keep constraints", () => {
++    const f = fixture();
++    try {
++      expect(f.config.allowDangerFullAccess).toBe(false);
++      expect(f.access).toMatchObject({ sandbox: "workspace-write", approvalPolicy: "never", permissionProfile: f.profile, expectedWritableRoots: [f.cwd] });
++      expect(executionAccessArguments(f.access)).toMatchObject({ "permission-profile": f.profile, "expected-writable-roots": [f.cwd] });
++      expect(threadAccessParams(f.access)).toMatchObject({ permissions: f.profile, runtimeWorkspaceRoots: [f.cwd] });
++      expect(threadAccessParams(f.access)).not.toHaveProperty("sandbox");
++      expect(() => resolveExecutionPolicy(f.config, { accessStrategy: "adaptive" }, f.original)).toThrow("PERMISSION_PROFILE_POLICY_CONFLICT");
++      expect(() => resolveExecutionPolicy(f.config, { accessStrategy: "read-only" }, f.cwd)).toThrow("PERMISSION_PROFILE_POLICY_CONFLICT");
++      expect(() => threadAccessParams(f.access, { "permissions.isolated-output.filesystem": { "/": "write" } })).toThrow("PERMISSION_PROFILE_OVERRIDE_DENIED");
++    } finally { cleanup(f.directory); }
++  });
++
++  it.each(["missing-roots", "missing-profile", "relative", "root", "empty", "duplicate", "builtin"])("rejects invalid operator configuration: %s", kind => {
++    const f = fixture();
++    try {
++      const env = { ...f.environment };
++      if (kind === "missing-roots") delete (env as Partial<typeof env>).CODEX_MCP_BRIDGE_EXPECTED_WRITABLE_ROOTS;
++      if (kind === "missing-profile") delete (env as Partial<typeof env>).CODEX_MCP_BRIDGE_DEFAULT_PERMISSION_PROFILE;
++      if (kind === "relative") env.CODEX_MCP_BRIDGE_EXPECTED_WRITABLE_ROOTS = '["relative"]';
++      if (kind === "root") env.CODEX_MCP_BRIDGE_EXPECTED_WRITABLE_ROOTS = '["/"]';
++      if (kind === "empty") env.CODEX_MCP_BRIDGE_EXPECTED_WRITABLE_ROOTS = '[]';
++      if (kind === "duplicate") env.CODEX_MCP_BRIDGE_EXPECTED_WRITABLE_ROOTS = JSON.stringify([f.cwd, f.cwd]);
++      if (kind === "builtin") env.CODEX_MCP_BRIDGE_DEFAULT_PERMISSION_PROFILE = ":workspace";
++      expect(() => loadConfig(env)).toThrow(/PERMISSION_PROFILE|WRITABLE_ROOTS/);
++    } finally { cleanup(f.directory); }
++  });
++
++  it.each(["old-write", "parent-write", "special-write", "nested", "network", "workspace-root", "inheritance", "missing-default", "unknown-grant"])("fails closed on an unverified effective profile: %s", kind => {
++    const f = fixture();
++    try {
++      const effective: any = structuredClone(f.effective), profile = effective.permissions[f.profile];
++      if (kind === "old-write") profile.filesystem[f.original] = "write";
++      if (kind === "parent-write") profile.filesystem[f.directory] = "write";
++      if (kind === "special-write") profile.filesystem[":slash_tmp"] = "write";
++      if (kind === "nested") profile.filesystem[f.cwd] = { ".": "write" };
++      if (kind === "network") profile.network.enabled = true;
++      if (kind === "workspace-root") profile.workspace_roots = { [f.original]: true };
++      if (kind === "inheritance") profile.extends = ":workspace";
++      if (kind === "missing-default") delete effective.default_permissions;
++      if (kind === "unknown-grant") profile.future_grants = { write_all: true };
++      expect(() => verifyNamedPermissionConfig(effective, f.access)).toThrow("PERMISSION_PROFILE_CONFIG_MISMATCH");
++    } finally { cleanup(f.directory); }
++  });
++
++  it("binds operator profile identity and exact output roots into the public execution envelope", () => {
++    const f = fixture();
++    try {
++      const settings = new UserSettingsStore(f.config), before = settings.taskExecutionEnvelopeRef();
++      f.config.defaultPermissionProfile = "different-profile";
++      expect(settings.taskExecutionEnvelopeRef()).not.toBe(before);
++      f.config.defaultPermissionProfile = f.profile;
++      expect(settings.taskExecutionEnvelopeRef()).toBe(before);
++      f.config.expectedWritableRoots = [f.original];
++      expect(settings.taskExecutionEnvelopeRef()).not.toBe(before);
++    } finally { cleanup(f.directory); }
++  });
++
++  it("rechecks the full profile before a loaded continuation and rejects configuration drift", async () => {
++    const f = fixture(), log = path.join(f.directory, "turns"), configFile = path.join(f.directory, "effective.json");
++    writeFileSync(configFile, JSON.stringify(f.effective));
++    const pool = new CodexAppServerUpstreamPool(path.resolve("test/fixtures/fake-codex-app-server.mjs"), 1, { environment: { ...process.env,
++      CODEX_TEST_PROFILE_CONFIG: JSON.stringify(f.effective), CODEX_TEST_PROFILE_CONFIG_FILE: configFile, CODEX_TEST_TURN_LOG: log } });
++    const request = { ...f.access, backendKind: "app-server" as const, prompt: "hello", selection: { model: "gpt-5.6-sol", reasoningEffort: "high" } };
++    try {
++      const result = await pool.startThread(request), threadId = result.structuredContent!.threadId as string;
++      const before = readFileSync(log, "utf8");
++      f.effective.permissions[f.profile].filesystem[f.original] = "write";
++      writeFileSync(configFile, JSON.stringify(f.effective));
++      await expect(pool.continueThread({ ...request, threadId })).rejects.toThrow("PERMISSION_PROFILE_CONFIG_MISMATCH");
++      expect(readFileSync(log, "utf8")).toBe(before);
++    } finally { await pool.close(); cleanup(f.directory); }
++  });
++
++  it("does not treat the incomplete legacy projection as the full permission grant", () => {
++    const f = fixture();
++    try {
++      verifyNamedPermissionConfig(f.effective, f.access);
++      const response = { ...f.access, runtimeWorkspaceRoots: [f.cwd], sandbox: { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true }, activePermissionProfile: { id: f.profile } };
++      expect(verifyExecutionAccess(response, f.access, "thread/start").activePermissionProfile?.id).toBe(f.profile);
++      expect(() => verifyExecutionAccess({ ...response, activePermissionProfile: { id: "different" } }, f.access, "thread/start")).toThrow("activePermissionProfile.id");
++      expect(() => verifyExecutionAccess({ ...response, sandbox: { ...response.sandbox, writableRoots: [f.original] } }, f.access, "thread/start")).toThrow("sandbox.writableRoots");
++      expect(() => verifyExecutionAccess({ ...response, sandbox: { ...response.sandbox, excludeSlashTmp: false } }, f.access, "thread/start")).toThrow("named profile sandbox boundary");
++    } finally { cleanup(f.directory); }
++  });
++
++  it("keeps the exact profile for fresh, loaded continuation, resumed, and forked turns", async () => {
++    const f = fixture(), log = path.join(f.directory, "requests"), turns = path.join(f.directory, "turns");
++    const pool = new CodexAppServerUpstreamPool(path.resolve("test/fixtures/fake-codex-app-server.mjs"), 1, { environment: { ...process.env,
++      CODEX_TEST_PROFILE_CONFIG: JSON.stringify(f.effective), CODEX_TEST_POLICY_LOG: log, CODEX_TEST_TURN_POLICY_LOG: turns } });
++    const request = { ...f.access, backendKind: "app-server" as const, prompt: "hello", selection: { model: "gpt-5.6-sol", reasoningEffort: "high" } };
++    try {
++      const fresh = await pool.startThread(request), threadId = fresh.structuredContent!.threadId as string;
++      await pool.continueThread({ ...request, threadId });
++      await pool.archiveThread(threadId); await pool.restoreThread(threadId);
++      await pool.continueThread({ ...request, threadId });
++      await pool.forkThread({ ...request, threadId });
++      const requests = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
++      expect(requests.map(entry => entry.method)).toEqual(["thread/start", "thread/resume", "thread/fork"]);
++      for (const entry of requests.filter(entry => entry.method !== "thread/resume")) {
++        expect(entry.params.permissions).toBe(f.profile); expect(entry.params.sandbox).toBeUndefined();
++      }
++      expect(requests[1].params).toEqual({ threadId });
++      const calls = readFileSync(turns, "utf8").trim().split("\n").map(line => JSON.parse(line));
++      expect(calls).toHaveLength(4);
++      for (const params of calls) expect(params).toMatchObject({ permissions: f.profile, approvalPolicy: "never", runtimeWorkspaceRoots: [f.cwd] });
++      for (const params of calls) expect(params.sandboxPolicy).toBeUndefined();
++    } finally { await pool.close(); cleanup(f.directory); }
++  });
++
++  it.each([false, true])("refuses to migrate an existing legacy context (unloaded=%s)", async unloaded => {
++    const f = fixture(), log = path.join(f.directory, "turns");
++    const pool = new CodexAppServerUpstreamPool(path.resolve("test/fixtures/fake-codex-app-server.mjs"), 1, { environment: { ...process.env, CODEX_TEST_PROFILE_CONFIG: JSON.stringify(f.effective), CODEX_TEST_TURN_LOG: log } });
++    const selection = { model: "gpt-5.6-sol", reasoningEffort: "high" };
++    const request = { ...f.access, backendKind: "app-server" as const, prompt: "hello", selection };
++    try {
++      const { permissionProfile: _profile, expectedWritableRoots: _roots, ...legacy } = request;
++      const result = await pool.startThread(legacy), threadId = result.structuredContent!.threadId as string;
++      if (unloaded) { await pool.archiveThread(threadId); await pool.restoreThread(threadId); }
++      const before = readFileSync(log, "utf8");
++      await expect(pool.continueThread({ ...request, threadId })).rejects.toThrow("EXECUTION_ACCESS_MISMATCH");
++      expect(readFileSync(log, "utf8")).toBe(before);
++    } finally { await pool.close(); cleanup(f.directory); }
++  });
++
++  it("starts no turn when config/read exposes an unexpected old-project write grant", async () => {
++    const f = fixture(), log = path.join(f.directory, "turns");
++    f.effective.permissions[f.profile].filesystem[f.original] = "write";
++    const pool = new CodexAppServerUpstreamPool(path.resolve("test/fixtures/fake-codex-app-server.mjs"), 1, { environment: { ...process.env, CODEX_TEST_PROFILE_CONFIG: JSON.stringify(f.effective), CODEX_TEST_TURN_LOG: log } });
++    try {
++      await expect(pool.startThread({ ...f.access, backendKind: "app-server", prompt: "hello", selection: { model: "gpt-5.6-sol", reasoningEffort: "high" } })).rejects.toThrow("PERMISSION_PROFILE_CONFIG_MISMATCH");
++      expect(() => readFileSync(log)).toThrow();
++    } finally { await pool.close(); cleanup(f.directory); }
++  });
++});
+diff --git a/test/questionOrchestration.test.ts b/test/questionOrchestration.test.ts
+index 936ab41..d02da4e 100644
+--- a/test/questionOrchestration.test.ts
++++ b/test/questionOrchestration.test.ts
+@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
+ import { mkdtemp, rm } from "node:fs/promises";
+ import { tmpdir } from "node:os";
+ import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { CodexAppServerUpstreamPool } from "../src/appServerUpstream.js";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+@@ -38,10 +40,10 @@ describe("GPT question orchestration", () => {
+     expect(result.isError, JSON.stringify(result)).not.toBe(true);
+     return result;
+   };
+-  const start = async () => {
++  const start = async (prompt = "Synthetic question test") => {
+     const project = settings.current.projects[0];
+     const result = await ok("codex_task", { requestId: randomUUID(), taskContractVersion: "2",
+-      executionEnvelopeRef: settings.taskExecutionEnvelopeRef(), prompt: "Synthetic question test", executionMode: "background",
++      executionEnvelopeRef: settings.taskExecutionEnvelopeRef(), prompt, executionMode: "background",
+       selection: { model: "gpt-5.6-sol", reasoningEffort: "max" },
+       project: { name: project.name, projectRef: project.projectRef, projectRevision: project.projectRevision } });
+     return result.structuredContent.jobId as string;
+@@ -154,6 +156,52 @@ describe("GPT question orchestration", () => {
+     expect(delivered).toEqual([]);
+   });
+ 
++  it.each(["input", "during answer", "completed only"])("round-trips native async questions through the same public MCP client to the exact fake App Server turn (%s)", async variant => {
++    await client.close();
++    await server.close();
++    const pool = new CodexAppServerUpstreamPool(fileURLToPath(new URL("./fixtures/fake-codex-app-server.mjs", import.meta.url)), 1);
++    const config = loadConfig({ CODEX_MCP_BRIDGE_NO_AUTH: "1", CODEX_MCP_BRIDGE_ROOTS: root });
++    jobs = new CodexJobRegistry({ allowedRoots: [root], stateStore: store });
++    server = createBridgeMcpServer(config, pool, new SessionRegistry({ stateStore: store }), jobs,
++      { getCatalog: async () => catalog, getCachedCatalog: () => catalog }, settings);
++    client = new Client({ name: "native-async-question-test", version: "1" });
++    const [a, b] = InMemoryTransport.createLinkedPair();
++    await Promise.all([client.connect(a), server.connect(b)]);
++    try {
++      const jobId = await start(`native async ${variant}`);
++      for (let attempt = 0; attempt < 200 && !jobs.get(jobId)?.pendingInteractions.length; attempt++) {
++        await new Promise(resolve => setTimeout(resolve, 10));
++      }
++      const snapshot = (await ok("codex_status", { query: { kind: "input", jobId } })).structuredContent;
++      expect(snapshot.active).toBe(true);
++      expect(snapshot.questions).toHaveLength(1);
++      expect(snapshot.questions[0]).toMatchObject({ isBlocking: false, questions: [
++        { id: "async:call-native-async-question:0", question: "Which color?", isOther: true },
++        { id: "async:call-native-async-question:1", question: "Any note?", isOther: true }
++      ] });
++      expect(jobs.get(jobId)!.pendingInteractions[0].transport).toBe("async-user-message");
++      expect(store.listJobs()).toEqual([expect.objectContaining({ pendingInteractions: [
++        expect.objectContaining({ transport: "async-user-message" })
++      ] })]);
++      expect((await call("codex_status", { query: { kind: "input", jobId } }, otherMeta)).isError).toBe(true);
++      const questionRef = snapshot.questions[0].questionRef;
++      const answers = { "async:call-native-async-question:0": ["blue"], "async:call-native-async-question:1": ["Only inspect"] };
++      const args = { jobId, requestId: randomUUID(), questionRef, answers };
++      expect((await call("codex_answer", args, otherMeta)).isError).toBe(true);
++      expect((await call("codex_answer", { ...args, answers: { "async:call-native-async-question:0": ["blue"] } })).isError).toBe(true);
++      expect(jobs.get(jobId)!.pendingInteractions).toHaveLength(1);
++      expect((await call("codex_answer", { ...args, decision: "accept" })).isError).toBe(true);
++      const [first, replay] = await Promise.all([ok("codex_answer", args), ok("codex_answer", args)]);
++      expect(first.structuredContent).toMatchObject({ delivery: "delivered" });
++      expect(replay.structuredContent).toEqual(first.structuredContent);
++      await jobs.get(jobId)!.promise;
++      expect(jobs.get(jobId)).toMatchObject({ status: "completed", pendingInteractions: [],
++        result: { content: [{ text: "STEERED:1. Which color?\nblue\n\n2. Any note?\nOnly inspect" }] } });
++      expect((await ok("codex_answer", args)).structuredContent.delivery).toBe("delivered");
++      expect((await call("codex_answer", { ...args, requestId: randomUUID() })).isError).toBe(true);
++    } finally { await pool.close(); }
++  });
++
+   it("waits for input rather than progress, and answers after unrelated Job revisions without a card", async () => {
+     const jobId = await start();
+     const initial = (await ok("codex_status", { query: { kind: "input", ...{ jobId } } })).structuredContent;
+@@ -208,8 +256,8 @@ describe("GPT question orchestration", () => {
+     expect(delivered).toHaveLength(1);
+   });
+ 
+-  it("drops old questions when the executing worker or turn is replaced", async () => {
+-    const jobId = await start(); question();
++  it.each([undefined, "async-user-message"] as const)("drops old questions when the executing worker or turn is replaced (transport=%s)", async transport => {
++    const jobId = await start(); question({ transport });
+     const input = (await ok("codex_status", { query: { kind: "input", ...{ jobId } } })).structuredContent;
+     assign?.({ backendKind: "app-server", workerId: "replacement-worker", workerGeneration: 2,
+       threadId: "fixture-thread", upstreamRequestId: "replacement-turn" });
+@@ -220,20 +268,20 @@ describe("GPT question orchestration", () => {
+     expect(delivered).toEqual([]);
+   });
+ 
+-  it("rejects changed questions, old workers, secrets, approvals and unknown input origins", async () => {
+-    const jobId = await start(); question();
++  it.each([undefined, "async-user-message"] as const)("rejects changed questions, old workers, secrets, approvals and unknown input origins (transport=%s)", async transport => {
++    const jobId = await start(); question({ transport });
+     const ref = (await ok("codex_status", { query: { kind: "input", ...{ jobId } } })).structuredContent.questions[0].questionRef;
+     const answer = { jobId, requestId: randomUUID(), questionRef: ref, answers: { color: ["Blue"] } };
+-    question({ questions: [{ ...field, question: "A changed question", isSecret: false }] });
++    question({ transport, questions: [{ ...field, question: "A changed question", isSecret: false }] });
+     expect((await call("codex_answer", answer)).isError).toBe(true);
+-    question(); jobs.get(jobId)!.workerGeneration = 2;
++    question({ transport }); jobs.get(jobId)!.workerGeneration = 2;
+     expect((await call("codex_answer", answer)).isError).toBe(true);
+     for (const origin of ["app-approval", "unknown"] as const) {
+-      question({ origin });
++      question({ transport, origin });
+       expect((await ok("codex_status", { query: { kind: "input", ...{ jobId } } })).structuredContent.questions).toEqual([]);
+       expect((await call("codex_answer", answer)).isError).toBe(true);
+     }
+-    question({ questions: [{ ...field, isSecret: true }] });
++    question({ transport, questions: [{ ...field, isSecret: true }] });
+     const secret = (await ok("codex_status", { query: { kind: "input", ...{ jobId } } })).structuredContent;
+     expect(secret.questions).toEqual([]); expect(secret.approvals).toHaveLength(1);
+     expect(delivered).toEqual([]);
+diff --git a/test/tools.test.ts b/test/tools.test.ts
+index 11633de..f036e87 100644
+--- a/test/tools.test.ts
++++ b/test/tools.test.ts
+@@ -14856,6 +14856,42 @@ describe("bridge tools", () => {
+     await close();
+   });
+ 
++  it("refuses new tasks in a retained project outside temporarily narrowed roots", async () => {
++    const outside = temporaryRoot();
++    const allowed = temporaryRoot();
++    const stateFile = path.join(temporaryRoot(), "state.sqlite");
++    const wideConfig = configFor(outside, { CODEX_MCP_BRIDGE_ROOTS: `${outside},${allowed}` });
++    const firstStore = new BridgeStateStore({ file: stateFile });
++    const originalSettings = new UserSettingsStore(wideConfig, { stateStore: firstStore });
++    originalSettings.updateWithProjectOperations({}, [
++      { kind: "add", project: { name: "Retained outside", cwd: outside } }
++    ], undefined, originalSettings.current.revision);
++    const projectId = originalSettings.current.projects[0]!.id;
++    firstStore.close();
++
++    const narrowConfig = configFor(allowed);
++    const stateStore = new BridgeStateStore({ file: stateFile });
++    const settings = new UserSettingsStore(narrowConfig, { stateStore });
++    const upstream = new FakeUpstream();
++    const { client, jobs, close } = await connectTestClient(
++      narrowConfig, upstream, undefined, new FakeModelCatalog(), settings, undefined, false
++    );
++    try {
++      expect(settings.current.projects.map(project => project.id)).toContain(projectId);
++      const denied = await runTask(client, {
++        prompt: "must not execute outside current roots", projectId,
++        agentName: "Outside roots", contextMode: "fresh"
++      });
++      expect(denied.isError).toBe(true);
++      expect(JSON.stringify(denied)).toContain("PROJECT_UNAVAILABLE");
++      expect(upstream.calls).toEqual([]);
++      expect(jobs.size).toBe(0);
++    } finally {
++      await close();
++      stateStore.close();
++    }
++  });
++
+   it("requires a registered project for multiple roots and retires every per-call cwd override", async () => {
+     const first = temporaryRoot();
+     const second = temporaryRoot();
