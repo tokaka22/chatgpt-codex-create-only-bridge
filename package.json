@@ -1,0 +1,26 @@
+{
+  "name": "chatgpt-codex-create-only-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Create-only document publishing for ChatGPT and local Codex.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "python3 -B -m unittest test_publisher test_guard test_configure && node test-adapter.mjs",
+    "test:python": "python3 -B -m unittest test_publisher test_guard test_configure",
+    "test:adapter": "node test-adapter.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.3.1",
+    "@modelcontextprotocol/node": "2.1.1",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tokaka22/chatgpt-codex-create-only-bridge.git"
+  }
+}

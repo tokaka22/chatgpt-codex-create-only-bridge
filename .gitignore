@@ -1,0 +1,15 @@
+node_modules/
+__pycache__/
+*.pyc
+test-artifacts/
+runtime/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.log
+auth.json
+credentials*
+.DS_Store
+upstream-core/
